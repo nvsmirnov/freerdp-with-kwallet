@@ -1,0 +1,355 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# if set, require getting secret from kwallet with this id (app id KWALLET_FOLDER)
+RUN_RDP_KWALLET_SECRET_ID="${RUN_RDP_KWALLET_SECRET_ID:-}"
+KWALLET_APP_NAME="${KWALLET_APP_NAME:-freerdp-with-kwallet}"
+KWALLET_FOLDER="${KWALLET_APP_NAME}"
+KWALLET_WALLET_ID="${KWALLET_WALLET_ID:-kdewallet}"
+
+FREERDP_CMD="${FREERDP_CMD:-xfreerdp3}"
+
+
+LOG_PREFIX="$(basename -- "$0")"
+
+KWALLET_WRITE_CMD_BASENAME="${KWALLET_WRITE_CMD_BASENAME:-freerdp-with-kwallet-write-helper}"
+KWALLET_WRITE_CMD="${KWALLET_WRITE_CMD:-$(command -v "${KWALLET_WRITE_CMD_BASENAME}")}" || true
+KWALLET_WRITE_CMD="${KWALLET_WRITE_CMD:-$(command -v "$(dirname -- "$0")/${KWALLET_WRITE_CMD_BASENAME}")}" || true
+
+log() {
+  local MSG
+  MSG="${*:-}"
+  echo >&2 -e "${LOG_PREFIX}[$$]: $MSG"
+}
+
+if [[ -z "${KWALLET_WRITE_CMD}" ]]; then
+  log "Could not find ${KWALLET_WRITE_CMD_BASENAME} command"
+  exit 1
+fi
+log "using kwallet write helper: ${KWALLET_WRITE_CMD}"
+
+# yad options for --image and --window-icon:
+#   dialog-error
+#   dialog-warning
+#   dialog-information
+#   dialog-question
+
+ask_and_save_new_secret() {
+  local SECRET
+  local RV
+  local USERNAME
+  local MSG
+  local ADD_MSG=""
+  local DIALOG_ADD_OPT=()
+
+  USERNAME="${1:-}"
+
+  while :; do
+    if [[ -n "$USERNAME" ]]; then
+      DIALOG_ADD_OPT=(--focus-field=2)
+    fi
+    MSG="$LOG_PREFIX"
+    MSG+=$'\n'
+    MSG+=$'\n'"Credentials for $RUN_RDP_KWALLET_SECRET_ID:"
+    if [[ -n "$ADD_MSG" ]]; then
+      MSG+="$ADD_MSG"
+    fi
+    log "Dialog:\n$MSG"
+    RV=0; SECRET="$(yad --no-top --center --selectable-labels \
+      --image=dialog-question --window-icon=dialog-question \
+      --title="Enter credentials" \
+      --text "$MSG" \
+      --form \
+      --field="Username[@domain]:" \
+      --field="Password::H" \
+      "${DIALOG_ADD_OPT[@]}" \
+      "${USERNAME}" "")" \
+      || RV=$?
+    case "$RV" in
+      0)
+        IFS='|' read -r USERNAME PASSWORD <<< "$SECRET"
+        if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
+          log "username or password is missing"
+          ADD_MSG=$'\n\n'"Both fields are required!"
+          continue
+        else
+          log "User supplied credentials (RV=$RV)"
+        fi
+        break
+        ;;
+      *)
+        log "User cancelled (RV=$RV)"
+        return 1
+        ;;
+    esac
+    log "ask_and_save_new_secret: internal error: should not have been here"
+    return 1
+  done # while
+
+  log "saving secret to wallet '${KWALLET_WALLET_ID}' folder '$KWALLET_FOLDER' / Passwords / '$RUN_RDP_KWALLET_SECRET_ID')"
+  # kwallet-query is broken, probably up to 6.28.x, so I replaced it with a python script
+  # if kwallet-query >&2 -v -f "${KWALLET_FOLDER}/Passwords" -w "${RUN_RDP_KWALLET_SECRET_ID}" "${KWALLET_WALLET_ID}" <<< "$SECRET" || RV=$?; then
+  if "${KWALLET_WRITE_CMD}" >&2 "${KWALLET_WALLET_ID}" "${KWALLET_FOLDER}" "${RUN_RDP_KWALLET_SECRET_ID}" "$KWALLET_APP_NAME" <<< "$SECRET" || RV=$?; then
+    log "secret saved (RV=$RV)"
+  else
+    MSG="$LOG_PREFIX"
+    MSG+=$'\n'
+    MSG+=$'\n'"Failed to save secret to kwallet"
+    MSG+=$'\n'"(folder $KWALLET_FOLDER / Passwords, secret id $RUN_RDP_KWALLET_SECRET_ID)"
+    MSG+=$'\n'
+    MSG+=$'\n'"Do you wish to continue without saving secret?"
+    MSG+=$'\n'
+    log "Dialog:\n$MSG"
+    RV=0; yad --no-top --center --selectable-labels \
+      --image=dialog-question --window-icon=dialog-question \
+      --text "$MSG" \
+      --button "Yes, continue anyway:0" --button "No:1" \
+      || RV=$?
+    case "$RV" in
+      0)
+        log "User answered 'yes' (RV=$RV)"
+        ;;
+      *)
+        log "User cancelled (RV=$RV)"
+        return 1
+        ;;
+    esac
+  fi
+  echo -n "$SECRET"
+}
+
+get_secret() {
+  local RV
+  local SECRET
+  local USERNAME=""
+  local PASSWORD
+  local MSG
+  local FAIL_REASON=""
+
+  log "get_secret: getting secret from kwallet: wallet=${KWALLET_WALLET_ID} folder=${KWALLET_FOLDER}/Passwords, key={RUN_RDP_KWALLET_SECRET_ID}"
+  RV=0; SECRET="$(kwallet-query -v -f "${KWALLET_FOLDER}/Passwords" -r "${RUN_RDP_KWALLET_SECRET_ID}" "${KWALLET_WALLET_ID}")" || RV=$?
+  case "$RV" in
+    0)
+      IFS='|' read -r USERNAME PASSWORD <<< "$SECRET"
+      if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
+        FAIL_REASON=":"$'\n\n'"Got empty username or password"$'\n'
+      else
+        log "got username and password from kwallet"
+      fi
+      ;;
+    4)
+      log "failed to get secret from kwallen (RV=$RV), assuming there is no secret in kwallet"
+      FAIL_REASON="NO_SECRET"
+      ;;
+    *)
+      FAIL_REASON=" (exit code=$RV)"
+      ;;
+  esac
+
+  if [[ -n "$FAIL_REASON" ]]; then
+    if [[ "$FAIL_REASON" == "NO_SECRET" ]]; then
+      RV=0
+    else
+      MSG="$LOG_PREFIX"
+      MSG+=$'\n'
+      MSG+=$'\n'"Failed to get secret from kwallet${FAIL_REASON}"
+      MSG+=$'\n'"(folder $KWALLET_FOLDER / Passwords, secret id $RUN_RDP_KWALLET_SECRET_ID)"
+      MSG+=$'\n'
+      MSG+=$'\n'"Do you wish to (try to) update credentials?"
+      MSG+=$'\n'
+      log "Dialog:\n$MSG"
+      RV=0; yad --no-top --center --selectable-labels \
+        --image=dialog-question --window-icon=dialog-question \
+        --text "$MSG" \
+        --button "Set password:0" --button "Cancel:1" \
+        || RV=$?
+      log "exit code from dialog; $RV"
+    fi
+    case "$RV" in
+      0)
+        if ! SECRET="$(ask_and_save_new_secret "$USERNAME")"; then
+          return 1
+        fi
+        ;;
+      *)
+        log "User cancelled (RV=$RV)"
+        return 1
+        ;;
+    esac
+  fi # if [[ -n "$FAIL_REASON" ]]
+
+  echo -n "$SECRET"
+}
+
+main() {
+  local RV
+  local SECRET
+  local USERNAME=""
+  local PASSWORD
+  local MSG
+  local FREERDP_FULL_COMMAND
+  local FREERDP_RV
+  local MSG_TIMEOUT
+  local SHOW_MSG
+  local ASK_NEW_PASSWORD
+  local DIALOG_ADD_OPT
+
+  if [[ -n "$RUN_RDP_KWALLET_SECRET_ID" ]]; then
+    SECRET="$(get_secret)"
+  else
+    MSG="$LOG_PREFIX"
+    MSG+=$'\n'
+    MSG+=$'\n'"You must specify secret id in RUN_RDP_KWALLET_SECRET_ID environment variable"
+    MSG+=$'\n'
+    log "Dialog:\n$MSG"
+    RV=0; yad --no-top --center --selectable-labels \
+      --image=dialog-question --window-icon=dialog-question \
+      --text "$MSG" \
+      --button "OK:0" \
+      || RV=$?
+    return 1
+  fi
+
+  IFS='|' read -r USERNAME PASSWORD <<< "$SECRET"
+
+  while :; do
+    SHOW_MSG=""; MSG_TIMEOUT=""; DIALOG_ADD_OPT=()
+    ASK_NEW_PASSWORD=""
+    FREERDP_FULL_COMMAND=("${FREERDP_CMD}" /from-stdin:force "/u:${USERNAME}" "$@")
+    # better not to log command because sometimes user enters password in username field
+    # log "running: ${FREERDP_FULL_COMMAND[@]}"
+    RV=0; "${FREERDP_FULL_COMMAND[@]}" <<< "$PASSWORD" || RV=$?
+    FREERDP_RV="$RV"
+    case "$RV" in
+      0)   : ;; # XF_EXIT_SUCCESS
+      1)                                                                  # XF_EXIT_DISCONNECT
+           SHOW_MSG="Remote server initiated disconnect"
+           DIALOG_ADD_OPT=(--timeout=60 --timeout-indicator=bottom)       # in my experince this code is used instead of XF_EXIT_CONN_REPLACED
+           ;;
+      2)   SHOW_MSG="Remote server initiated logoff"; ;;                  # XF_EXIT_LOGOFF
+      3)   SHOW_MSG="Session disconnected due to idle timeout"; ;;        # XF_EXIT_IDLE_TIMEOUT
+      4)   SHOW_MSG="Session disconnected due to logon timeout"; ;;       # XF_EXIT_LOGON_TIMEOUT
+      5)                                                                  # XF_EXIT_CONN_REPLACED
+           SHOW_MSG="The session was replaced with another session"
+           DIALOG_ADD_OPT=(--timeout=60 --timeout-indicator=bottom)
+           ;;           
+      6)   SHOW_MSG="Freerdp reported XF_EXIT_OUT_OF_MEMORY"; ;;
+      7)   SHOW_MSG="Connection denied by server"; ;;                     # XF_EXIT_CONN_DENIED
+      8)   SHOW_MSG="Connection denied due to FIPS requirements"; ;;      # XF_EXIT_CONN_DENIED_FIPS
+      9)   SHOW_MSG="Insufficient user privileges"; ;;                    # XF_EXIT_USER_PRIVILEGES
+      10)  SHOW_MSG="Fresh credentials are required"; ;;                  # XF_EXIT_FRESH_CREDENTIALS_REQUIRED
+      11)  SHOW_MSG="Session disconnected by user or administrator"; ;;   # XF_EXIT_DISCONNECT_BY_USER
+      12)  SHOW_MSG="User logged off from the remote session"; ;;         # ERRINFO_LOGOFF_BY_USER
+
+      16)  SHOW_MSG="Remote Desktop licensing: internal error"; ;;
+      17)  SHOW_MSG="Remote Desktop licensing: no license server available"; ;;
+      18)  SHOW_MSG="Remote Desktop licensing: no valid license available"; ;;
+      19)  SHOW_MSG="Remote Desktop licensing: invalid client message"; ;;
+      20)  SHOW_MSG="Remote Desktop licensing: hardware ID mismatch"; ;;
+      21)  SHOW_MSG="Remote Desktop licensing: invalid client license"; ;;
+      22)  SHOW_MSG="Remote Desktop licensing protocol failed"; ;;
+      23)  SHOW_MSG="Remote Desktop licensing protocol terminated prematurely"; ;;
+      24)  SHOW_MSG="Remote Desktop licensing: license encryption failed"; ;;
+      25)  SHOW_MSG="Remote Desktop licensing: license upgrade failed"; ;;
+      26)  SHOW_MSG="Remote server is not licensed for Remote Desktop connections"; ;;
+
+      32)  SHOW_MSG="RDP protocol error"; ;;                              # XF_EXIT_RDP
+
+      128) SHOW_MSG="Invalid command-line arguments or configuration"; ;; # XF_EXIT_PARSE_ARGUMENTS
+      129) SHOW_MSG="Memory allocation error"; ;;                         # XF_EXIT_MEMORY
+      130) SHOW_MSG="Protocol error"; ;;                                  # XF_EXIT_PROTOCOL
+      131) SHOW_MSG="Connection failed"; ;;                               # XF_EXIT_CONN_FAILED
+      132) SHOW_MSG="Authentication failed"; ;;                           # XF_EXIT_AUTH_FAILURE
+      133) SHOW_MSG="Security negotiation failed"; ;;                     # XF_EXIT_NEGO_FAILURE
+      134)                                                                # XF_EXIT_LOGON_FAILURE
+          SHOW_MSG="Logon failed"
+          ASK_NEW_PASSWORD=1
+          ;;
+      135) SHOW_MSG="Account is locked out"; ;;                           # XF_EXIT_ACCOUNT_LOCKED_OUT
+      136) SHOW_MSG="Pre-connect initialization failed"; ;;               # XF_EXIT_PRE_CONNECT_FAILED
+      137) SHOW_MSG="Undefined connection error"; ;;                      # XF_EXIT_CONNECT_UNDEFINED
+      138) SHOW_MSG="Post-connect initialization failed"; ;;              # XF_EXIT_POST_CONNECT_FAILED
+      139) SHOW_MSG="DNS error"; ;;                                       # XF_EXIT_DNS_ERROR
+      140) SHOW_MSG="Remote host name not found"; ;;                      # XF_EXIT_DNS_NAME_NOT_FOUND
+      141) SHOW_MSG="Unable to establish connection"; ;;                  # XF_EXIT_CONNECT_FAILED
+      142) SHOW_MSG="MCS Connect Initial failed"; ;;                      # XF_EXIT_MCS_CONNECT_INITIAL_ERROR
+      143) SHOW_MSG="TLS connection failed"; ;;                           # XF_EXIT_TLS_CONNECT_FAILED
+      144) SHOW_MSG="Insufficient privileges"; ;;                         # XF_EXIT_INSUFFICIENT_PRIVILEGES
+      # 145) SHOW_MSG="Connection attempt was cancelled"; ;;                # XF_EXIT_CONNECT_CANCELLED
+      145) :; ;;                                                          # XF_EXIT_CONNECT_CANCELLED
+
+      # 146 is currently unused
+
+      147) SHOW_MSG="Transport connection failed"; ;;                     # XF_EXIT_CONNECT_TRANSPORT_FAILED
+      148) SHOW_MSG="Password has expired"; ;;                            # XF_EXIT_PASSWORD_EXPIRED
+      149) SHOW_MSG="Password must be changed"; ;;                        # XF_EXIT_PASSWORD_MUST_CHANGE
+      150) SHOW_MSG="Kerberos KDC is unreachable"; ;;                     # XF_EXIT_KDC_UNREACHABLE
+      151) SHOW_MSG="Account is disabled"; ;;                             # XF_EXIT_ACCOUNT_DISABLED
+      152) SHOW_MSG="Password appears to have expired"; ;;                # XF_EXIT_PASSWORD_CERTAINLY_EXPIRED
+      153) SHOW_MSG="Client credentials have been revoked"; ;;            # XF_EXIT_CLIENT_REVOKED
+      154)                                                                # XF_EXIT_WRONG_PASSWORD
+          SHOW_MSG="Wrong password"
+          ASK_NEW_PASSWORD=1
+          ;;
+      155) SHOW_MSG="Access denied"; ;;                                   # XF_EXIT_ACCESS_DENIED
+      156) SHOW_MSG="Account restriction prevents logon"; ;;              # XF_EXIT_ACCOUNT_RESTRICTION
+      157) SHOW_MSG="Account has expired"; ;;                             # XF_EXIT_ACCOUNT_EXPIRED
+      158) SHOW_MSG="Remote Desktop logon is not permitted for this user"; ;; # XF_EXIT_LOGON_TYPE_NOT_GRANTED
+      159) SHOW_MSG="Credentials are missing"; ;;                         # XF_EXIT_NO_OR_MISSING_CREDENTIALS
+      160) SHOW_MSG="Remote system is still booting"; ;;                  # XF_EXIT_TARGET_BOOTING
+      161) SHOW_MSG="Server requires NLA/Hybrid security"; ;;             # XF_EXIT_HYBRID_REQUIRED_BY_SERVER
+
+      255) SHOW_MSG="Unknown FreeRDP error (RV=$RV)"; ;;                  # XF_EXIT_UNKNOWN
+
+      *)   SHOW_MSG="FreeRDP exited with unknown status (RV=$RV)"$'\n'$'\n'"(if it is ok, you may wish to add it to $0)"; ;;
+    esac
+
+    if [[ -n "$ASK_NEW_PASSWORD" ]]; then
+      MSG="$LOG_PREFIX"
+      MSG+=$'\n'
+      MSG+=$'\n'"$SHOW_MSG"
+      MSG+=$'\n'
+      MSG+=$'\n'"Do you want to try with another credentials?"
+      MSG+=$'\n'
+      log "Dialog:\n$MSG"
+      RV=0; yad --no-top --center --selectable-labels \
+        --image=dialog-question --window-icon=dialog-question \
+        --text "$MSG" \
+        --button "Yes, enter new password:0" --button "Cancel:1" \
+        "${DIALOG_ADD_OPT[@]}" \
+        || RV=$?
+      case "$RV" in
+        0)
+          log "User answered 'Yes' (RV=$RV)"
+          if ! SECRET="$(ask_and_save_new_secret "$USERNAME")"; then
+            return 1
+          fi
+          ;;
+        *)
+          log "User cancelled (RV=$RV)"
+          return 1
+          ;;
+      esac
+      continue
+    fi
+
+    if [[ -n "$SHOW_MSG" ]]; then
+      MSG="$LOG_PREFIX"
+      MSG+=$'\n'
+      MSG+=$'\n'"$SHOW_MSG"
+      MSG+=$'\n'
+      log "Dialog:\n$MSG"
+      yad --no-top --center --selectable-labels \
+        --image=dialog-information --window-icon=dialog-information \
+        --text "$MSG" \
+        --button "OK:0" \
+        "${DIALOG_ADD_OPT[@]}" \
+        || true
+    fi
+    log "freerdp exited with code $FREERDP_RV, exiting with same code"
+    return "$FREERDP_RV"
+  done
+}
+
+main "$@"

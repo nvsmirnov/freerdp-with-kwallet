@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+
+# kwallet-query is broken, probably up to 6.28.x, so this is a replacement
+# if it would work, it whould be just like this:
+# kwallet-query -v -f FOLDER -w KEY wallet_name <<< "SECRET"
+
+import sys
+import dbus
+
+def log(msg):
+    print("freerdp-with-kwallet-write-helper: "+msg, file=sys.stderr, flush=True)
+
+try:
+    wallet_name = sys.argv[1]
+    folder = sys.argv[2]
+    key    = sys.argv[3]
+    app    = sys.argv[4]
+except IndexError:
+    log("ERROR: usage: freerdp-with-kwallet-write-helper wallet_name folder key app")
+    sys.exit(1)
+
+secret = sys.stdin.read()
+if not len(secret):
+    log(f"ERROR: got empty secret from stdin")
+    sys.exit(1)
+
+log("D-Bus: connecting to session bus...")
+bus = dbus.SessionBus()
+obj = bus.get_object( "org.kde.kwalletd6", "/modules/kwalletd6")
+kwallet = dbus.Interface(obj, "org.kde.KWallet")
+log("D-Bus: connected")
+
+log(f"KWallet: opening wallet {wallet_name!r}...")
+handle = kwallet.open(
+    wallet_name,
+    0,
+    app,
+)
+
+if handle < 0:
+    log(f"KWallet: opening wallet {wallet_name!r}: FAILED (handle={handle})")
+    sys.exit(1)
+
+log(f"KWallet: opening wallet {wallet_name!r}: OK")
+
+log(f"KWallet: checking folder {folder!r}...")
+exists = kwallet.hasFolder(
+    handle,
+    folder,
+    app,
+)
+
+if exists:
+    log(f"KWallet: folder {folder!r} exists: OK")
+else:
+    log(f"KWallet: folder {folder!r} does not exist")
+
+    log(f"KWallet: creating folder {folder!r}...")
+    created = kwallet.createFolder(
+        handle,
+        folder,
+        app,
+    )
+
+    if not created:
+        log(f"KWallet: creating folder {folder!r}: FAILED")
+        sys.exit(1)
+
+    log(f"KWallet: creating folder {folder!r}: OK")
+
+log(f"KWallet: writing password for {key!r}...")
+try:
+    result = kwallet.writePassword(
+        handle,
+        folder + "/Passwords",
+        key,
+        secret,
+        app,
+    )
+except Exception as e:
+    # not printing repr(e) / traceback:
+    # just in case there will be our secret printed
+    log(f"ERROR: {type(e).__name__}")
+    sys.exit(1)
+
+if result != 0:
+    log(f"KWallet: writing password for {key!r}: FAILED (result={result})")
+    sys.exit(1)
+
+log(f"KWallet: writing password for {key!r}: OK (result={result})")
